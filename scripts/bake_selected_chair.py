@@ -4,7 +4,7 @@ Usage in Blender:
   1. Select exactly one chair mesh and make it the active object.
   2. Open this file in Blender's Text Editor and press Run Script.
 
-The script keeps existing materials intact and writes 4096px PNG files to
+The script keeps existing materials intact and writes 2048px PNG files to
 ``//baked_<object_name>/`` beside the current .blend file.
 """
 
@@ -14,8 +14,12 @@ from pathlib import Path
 import bpy
 
 
-TEXTURE_SIZE = 4096
-BAKE_MARGIN = 32
+# Conservative defaults keep the bake usable on machines with modest RAM.
+# A 4096px RGBA bake buffer is four times larger than a 2048px one, and Blender
+# may keep several such buffers resident while the script runs.
+TEXTURE_SIZE = 2048
+BAKE_MARGIN = 16
+BAKE_SAMPLES = 16
 
 
 def safe_name(value):
@@ -60,6 +64,7 @@ def image_for(label, output_dir, non_color=False):
 
 def activate_image_in_all_materials(obj, image, label):
     """Cycles bakes to the active Image Texture node in every material."""
+    targets = []
     for material in {slot.material for slot in obj.material_slots if slot.material}:
         material.use_nodes = True
         nodes = material.node_tree.nodes
@@ -69,22 +74,36 @@ def activate_image_in_all_materials(obj, image, label):
         node.image = image
         node.select = True
         nodes.active = node
+        targets.append((nodes, node))
+    return targets
+
+
+def remove_bake_targets(targets):
+    """Discard temporary nodes after each pass to keep the scene lightweight."""
+    for nodes, node in targets:
+        nodes.remove(node)
 
 
 def bake_standard(obj, image, bake_type):
-    activate_image_in_all_materials(obj, image, image.name)
-    bpy.ops.object.bake(type=bake_type, margin=BAKE_MARGIN, use_clear=True)
-    image.save()
+    targets = activate_image_in_all_materials(obj, image, image.name)
+    try:
+        bpy.ops.object.bake(type=bake_type, margin=BAKE_MARGIN, use_clear=True)
+        image.save()
+    finally:
+        remove_bake_targets(targets)
 
 
 def bake_base_color(obj, image):
-    activate_image_in_all_materials(obj, image, image.name)
+    targets = activate_image_in_all_materials(obj, image, image.name)
     scene = bpy.context.scene
     scene.render.bake.use_pass_direct = False
     scene.render.bake.use_pass_indirect = False
     scene.render.bake.use_pass_color = True
-    bpy.ops.object.bake(type="DIFFUSE", margin=BAKE_MARGIN, use_clear=True)
-    image.save()
+    try:
+        bpy.ops.object.bake(type="DIFFUSE", margin=BAKE_MARGIN, use_clear=True)
+        image.save()
+    finally:
+        remove_bake_targets(targets)
 
 
 def metallic_source(material):
@@ -123,11 +142,13 @@ def bake_metallic(obj, image):
         tree.links.new(emission.outputs["Emission"], surface)
         restorations.append((tree, emission, old_links))
 
+    targets = []
     try:
-        activate_image_in_all_materials(obj, image, image.name)
+        targets = activate_image_in_all_materials(obj, image, image.name)
         bpy.ops.object.bake(type="EMIT", margin=BAKE_MARGIN, use_clear=True)
         image.save()
     finally:
+        remove_bake_targets(targets)
         for tree, emission, old_links in restorations:
             for link in list(emission.outputs["Emission"].links):
                 tree.links.remove(link)
@@ -153,19 +174,26 @@ def main():
     scene = bpy.context.scene
     scene.render.engine = "CYCLES"
     scene.cycles.device = "CPU"
+    scene.cycles.samples = BAKE_SAMPLES
     scene.render.bake.target = "IMAGE_TEXTURES"
     scene.render.bake.use_selected_to_active = False
     scene.render.bake.margin = BAKE_MARGIN
 
-    base_color = image_for("BaseColor", output_dir)
-    roughness = image_for("Roughness", output_dir, non_color=True)
-    metallic = image_for("Metallic", output_dir, non_color=True)
-    normal = image_for("Normal", output_dir, non_color=True)
-
-    bake_base_color(obj, base_color)
-    bake_standard(obj, roughness, "ROUGHNESS")
-    bake_metallic(obj, metallic)
-    bake_standard(obj, normal, "NORMAL")
+    # Process one map at a time and release its pixel buffer immediately after
+    # saving. This avoids holding four full-resolution bake buffers in RAM.
+    bake_jobs = (
+        ("BaseColor", False, bake_base_color, None),
+        ("Roughness", True, bake_standard, "ROUGHNESS"),
+        ("Metallic", True, bake_metallic, None),
+        ("Normal", True, bake_standard, "NORMAL"),
+    )
+    for label, non_color, bake_function, bake_type in bake_jobs:
+        image = image_for(label, output_dir, non_color=non_color)
+        if bake_type is None:
+            bake_function(obj, image)
+        else:
+            bake_function(obj, image, bake_type)
+        image.buffers_free()
 
     print(f"Finished baking {obj.name} to {output_dir}")
 

@@ -21,6 +21,7 @@ def arguments():
     parser.add_argument("--resolution", type=int, default=2048)
     parser.add_argument("--output-dir", default="baked_chair")
     parser.add_argument("--margin", type=int, default=16)
+    parser.add_argument("--samples", type=int, default=16)
     parser.add_argument("--dry-run", action="store_true")
     argv = sys.argv[sys.argv.index("--") + 1 :] if "--" in sys.argv else []
     return parser.parse_args(argv)
@@ -140,6 +141,8 @@ def main():
     args = arguments()
     if args.resolution < 64 or args.resolution > 16384:
         raise ValueError("Resolution must be between 64 and 16384")
+    if args.samples < 1:
+        raise ValueError("Samples must be at least 1")
     sources = source_meshes()
     print("Source meshes:", ", ".join(obj.name for obj in sources))
     if args.dry_run:
@@ -157,6 +160,7 @@ def main():
     ensure_materials(target)
     bpy.context.scene.render.engine = "CYCLES"
     bpy.context.scene.cycles.device = "CPU"
+    bpy.context.scene.cycles.samples = args.samples
 
     specs = {
         "BaseColor": ("DIFFUSE", "sRGB"),
